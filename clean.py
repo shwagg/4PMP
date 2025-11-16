@@ -1,239 +1,279 @@
-#!/usr/bin/env python3
-"""
-EKSMC - Clean implementation (encrypt/decrypt)
-
-Usage:
-  Non-interactive (preferred for automation):
-      Provide stdin with:
-        ------ESC------
-        <plaintext>
-        <passphrase>
-      The program prints the JSON ciphertext package to stdout.
-
-  Interactive:
-      The script prompts:
-        [1] Encrypt
-        [2] Decrypt
-"""
-
-import sys
+import os
 import json
 import base64
 import hashlib
-import secrets
-from typing import Tuple, List
+import sys
 
-# -------------------------
-# Helpers
-# -------------------------
+
 def b64e(b: bytes) -> str:
-    return base64.b64encode(b).decode("utf-8")
+    return base64.b64encode(b).decode()
 
 def b64d(s: str) -> bytes:
-    return base64.b64decode(s)
+    return base64.b64decode(s) if s else b""
 
-# -------------------------
-# Key derivation
-# -------------------------
-def derive_key(passphrase: str, salt: bytes, iterations: int = 200_000, dklen: int = 16) -> bytes:
-    return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, iterations, dklen=dklen)
+def pbkdf2_key(passphrase: str, salt: bytes, length: int = 16) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", passphrase.encode(), salt, 100000)[:length]
 
-# -------------------------
-# Substitution (forward / reverse)
-# -------------------------
-def substitute(chars: List[str], flags: List[int], key: bytes) -> List[str]:
-    out = []
-    for i, ch in enumerate(chars):
-        kb = key[i % len(key)]
-        if flags[i] == 1 and ch.isalpha():
-            base = ord("A") if ch.isupper() else ord("a")
-            old = ord(ch) - base
-            shift = kb % 26
-            out.append(chr(base + ((old + shift) % 26)))
-        else:
-            out.append(chr((ord(ch) + kb) % 0x110000))
-    return out
-
-def reverse_substitute(chars: List[str], flags: List[int], key: bytes) -> List[str]:
-    out = []
-    for i, ch in enumerate(chars):
-        kb = key[i % len(key)]
-        if flags[i] == 1 and ch.isalpha():
-            base = ord("A") if ch.isupper() else ord("a")
-            old = ord(ch) - base
-            shift = kb % 26
-            out.append(chr(base + ((old - shift) % 26)))
-        else:
-            out.append(chr((ord(ch) - kb) % 0x110000))
-    return out
-
-# -------------------------
-# Shift-merge transposition (forward / reverse)
-# -------------------------
-def shiftmerge_transpose(seq: List[str], key: bytes) -> List[str]:
-    odds = seq[0::2]
-    evens = seq[1::2]
-    if evens:
-        shift_amt = key[1] % len(evens)
-        evens = evens[-shift_amt:] + evens[:-shift_amt]
-    merged = []
-    o = e = 0
-    for i in range(len(seq)):
-        if i % 2 == 0:
-            merged.append(odds[o]); o += 1
-        else:
-            merged.append(evens[e]); e += 1
-    return merged
-
-def shiftmerge_untranspose(seq: List[str], key: bytes) -> List[str]:
-    odds = seq[0::2]
-    evens = seq[1::2]
-    if evens:
-        shift_amt = key[1] % len(evens)
-        evens = evens[shift_amt:] + evens[:shift_amt]
-    out = []
-    o = e = 0
-    for i in range(len(seq)):
-        if i % 2 == 0:
-            out.append(odds[o]); o += 1
-        else:
-            out.append(evens[e]); e += 1
-    return out
-
-# -------------------------
-# Keystream-based XOR (SHA-256 counter mode)
-# -------------------------
-def keystream_xor(label: str, key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
-    out = bytearray()
+def keystream(key: bytes, nonce: bytes, label: str, length: int) -> bytes:
+    out = b""
     counter = 0
-    while len(out) < len(plaintext):
-        block = hashlib.sha256(
-            key + nonce + label.encode("utf-8") + counter.to_bytes(4, "big")
-        ).digest()
-        out.extend(block)
+    while len(out) < length:
+        blk = hashlib.sha256(key + nonce + label.encode() + counter.to_bytes(4, "big")).digest()
+        out += blk
         counter += 1
-    return bytes(p ^ k for p, k in zip(plaintext, out[:len(plaintext)]))
+    return out[:length]
 
-# -------------------------
-# High-level encrypt/decrypt
-# -------------------------
+# ----------------------
+# EKSMC: Encryption
+# ----------------------
 def encrypt(plaintext: str, passphrase: str) -> dict:
-    salt = secrets.token_bytes(16)
-    key = derive_key(passphrase, salt)
-    nonce = secrets.token_bytes(12)
+    salt = os.urandom(16)
+    key = pbkdf2_key(passphrase, salt)
 
-    compact_chars = []
+    # 1) remove spaces, record their positions (positions relative to compact)
     space_positions = []
-    flags = []
-
+    compact_chars = []
     for ch in plaintext:
         if ch == " ":
             space_positions.append(len(compact_chars))
         else:
             compact_chars.append(ch)
-            flags.append(1 if ch.isalpha() else 0)
+    compact_len = len(compact_chars)
 
-    substituted = substitute(compact_chars, flags, key)
-    transposed = shiftmerge_transpose(substituted, key)
-    main_bytes = "".join(transposed).encode("utf-8")
+    # 2) flags and case_flags
+    # flags: 1 = alphabetic, 0 = non-alpha
+    # case_flags: 1 = uppercase, 0 = lowercase, 2 = non-letter
+    flags = [1 if c.isalpha() else 0 for c in compact_chars]
+    case_flags = []
+    for c in compact_chars:
+        if c.isalpha():
+            case_flags.append(1 if c.isupper() else 0)
+        else:
+            case_flags.append(2)
 
-    sp_bytes = ",".join(map(str, space_positions)).encode("utf-8")
-    fl_bytes = bytes(flags)
+    flag_bytes = bytes(flags)                 # length = compact_len
+    case_bytes = bytes(case_flags)            # length = compact_len
 
-    sp_enc = keystream_xor("space", key, nonce, sp_bytes)
-    fl_enc = keystream_xor("flags", key, nonce, fl_bytes)
+    # 3) keyed substitution (output as bytes)
+    substituted = []
+    for i, ch in enumerate(compact_chars):
+        k = key[i % len(key)]
+        if ch.isalpha():
+            base = ord('A') if ch.isupper() else ord('a')
+            val = ord(ch) - base
+            newv = (val + (k % 26)) % 26
+            substituted.append(base + newv)   # store ASCII code
+        else:
+            substituted.append((ord(ch) + k) % 256)
 
-    noiseL = secrets.token_bytes(3)
-    noiseR = secrets.token_bytes(3)
+    # 4) shift-merge transposition (odd/even groups and rotate even)
+    odd = substituted[0::2]
+    even = substituted[1::2]
 
-    return {
+    if len(even) > 0:
+        s = key[1] % len(even)
+        if s != 0:
+            even = even[-s:] + even[:-s]  # right rotate by s
+
+    merged = []
+    o = e = 0
+    while o < len(odd) or e < len(even):
+        if o < len(odd):
+            merged.append(odd[o]); o += 1
+        if e < len(even):
+            merged.append(even[e]); e += 1
+
+    main_bytes = bytes(merged)  # length = compact_len
+
+    # 5) encrypt metadata (space_positions, flags, case_flags) with keystream
+    nonce = os.urandom(12)
+
+    space_bytes = ",".join(map(str, space_positions)).encode() if space_positions else b""
+    ks_space = keystream(key, nonce, "space", len(space_bytes))
+    space_enc = bytes([a ^ b for a, b in zip(space_bytes, ks_space)]) if space_bytes else b""
+
+    ks_flags = keystream(key, nonce, "flags", len(flag_bytes))
+    flags_enc = bytes([a ^ b for a, b in zip(flag_bytes, ks_flags)]) if flag_bytes else b""
+
+    ks_case = keystream(key, nonce, "case", len(case_bytes))
+    case_enc = bytes([a ^ b for a, b in zip(case_bytes, ks_case)]) if case_bytes else b""
+
+    # 6) package and save to file to avoid copy problems
+    package = {
         "salt": b64e(salt),
         "nonce": b64e(nonce),
         "main_cipher": b64e(main_bytes),
-        "noiseL": b64e(noiseL),
-        "space_enc": b64e(sp_enc),
-        "flags_enc": b64e(fl_enc),
-        "noiseR": b64e(noiseR),
+        "space_enc": b64e(space_enc),
+        "flags_enc": b64e(flags_enc),
+        "case_enc": b64e(case_enc),
+        "compact_len": compact_len
     }
 
-def decrypt(package_json: str, passphrase: str) -> str:
-    pkg = json.loads(package_json)
+    with open("cipher.json", "w") as f:
+        json.dump(package, f, indent=4)
 
-    salt = b64d(pkg["salt"])
-    nonce = b64d(pkg["nonce"])
-    key = derive_key(passphrase, salt)
+    return package
 
-    sp_enc = b64d(pkg["space_enc"])
-    fl_enc = b64d(pkg["flags_enc"])
-    main_bytes = b64d(pkg["main_cipher"])
+# ----------------------
+# EKSMC: Decryption
+# ----------------------
+def decrypt(package: dict, passphrase: str) -> str:
+    required = ["salt","nonce","main_cipher","space_enc","flags_enc","case_enc","compact_len"]
+    for r in required:
+        if r not in package:
+            raise ValueError(f"Missing field in package: {r}")
 
-    sp_bytes = keystream_xor("space", key, nonce, sp_enc)
-    fl_bytes = keystream_xor("flags", key, nonce, fl_enc)
+    salt = b64d(package["salt"])
+    nonce = b64d(package["nonce"])
+    main_bytes = b64d(package["main_cipher"])
+    space_enc = b64d(package["space_enc"])
+    flags_enc = b64d(package["flags_enc"])
+    case_enc = b64d(package["case_enc"])
+    compact_len = int(package["compact_len"])
 
-    space_positions = list(map(int, sp_bytes.decode("utf-8").split(","))) if sp_bytes else []
-    flags = list(fl_bytes)
+    key = pbkdf2_key(passphrase, salt)
 
-    transposed = list(main_bytes.decode("utf-8"))
-    untransposed = shiftmerge_untranspose(transposed, key)
-    reversed_sub = reverse_substitute(untransposed, flags, key)
+    # sanity checks
+    if len(main_bytes) != compact_len:
+        raise ValueError(f"main_cipher length ({len(main_bytes)}) != compact_len ({compact_len})")
+    if len(flags_enc) != compact_len:
+        raise ValueError(f"flags_enc length ({len(flags_enc)}) != compact_len ({compact_len})")
+    if len(case_enc) != compact_len:
+        raise ValueError(f"case_enc length ({len(case_enc)}) != compact_len ({compact_len})")
 
-    result = reversed_sub[:]
-    for pos in space_positions:
-        if 0 <= pos <= len(result):
-            result.insert(pos, " ")
+    # recover flags and case_flags
+    ks_flags = keystream(key, nonce, "flags", compact_len)
+    flag_bytes = bytes([a ^ b for a, b in zip(flags_enc, ks_flags)])
+    flags = list(flag_bytes)
 
-    return "".join(result)
+    ks_case = keystream(key, nonce, "case", compact_len)
+    case_bytes = bytes([a ^ b for a, b in zip(case_enc, ks_case)])
+    case_flags = list(case_bytes)
 
-# -------------------------
-# CLI / stdin parsing
-# -------------------------
-def parse_stdin_block() -> Tuple[str, str]:
-    data = sys.stdin.read().splitlines()
-    try:
-        i = data.index("------ESC------")
-    except ValueError:
-        return None, None
-    plaintext = data[i + 1] if i + 1 < len(data) else ""
-    passphrase = data[i + 2] if i + 2 < len(data) else ""
-    return plaintext, passphrase
+    # recover spaces
+    ks_space = keystream(key, nonce, "space", len(space_enc)) if space_enc else b""
+    space_bytes = bytes([a ^ b for a, b in zip(space_enc, ks_space)]) if space_enc else b""
+    space_positions = [int(x) for x in space_bytes.decode().split(",")] if space_bytes else []
 
-def main():
-    plaintext, passphrase = parse_stdin_block()
+    # reverse transposition
+    merged = list(main_bytes)  # list of ints
+    L = len(merged)
+    odd_len = (L + 1) // 2
+    odd = merged[:odd_len]
+    even = merged[odd_len:]
 
-    if plaintext and passphrase:
-        package = encrypt(plaintext, passphrase)
-        print(json.dumps(package))
-        return
+    # undo the right rotate by left-rotating
+    if len(even) > 0:
+        s = key[1] % len(even)
+        if s != 0:
+            even = even[s:] + even[:s]
 
+    restored = []
+    oi = ei = 0
+    for i in range(L):
+        if i % 2 == 0:
+            restored.append(odd[oi]); oi += 1
+        else:
+            restored.append(even[ei]); ei += 1
+
+    # reverse substitution using flags & case_flags (deterministic)
+    result_chars = []
+    for i, code in enumerate(restored):
+        k = key[i % len(key)]
+        if flags[i] == 1:
+            # use explicit case_flags to determine base
+            if case_flags[i] == 1:
+                base = ord('A')
+            elif case_flags[i] == 0:
+                base = ord('a')
+            else:
+                # fallback: assume lowercase (shouldn't happen)
+                base = ord('a')
+            val = code - base
+            orig = (val - (k % 26)) % 26
+            result_chars.append(chr(base + orig))
+        else:
+            orig = (code - k) % 256
+            result_chars.append(chr(orig))
+
+    # reinsert spaces (descending order)
+    for pos in sorted(space_positions, reverse=True):
+        if pos < 0:
+            continue
+        if pos > len(result_chars):
+            result_chars.append(" ")
+        else:
+            result_chars.insert(pos, " ")
+
+    return "".join(result_chars)
+
+# ----------------------
+# CLI helpers
+# ----------------------
+def read_multiline_json_prompt():
+    print("Paste JSON (multi-line allowed). End with an empty line:")
+    lines = []
     while True:
-        print("\n=== EKSMC ===")
-        print("[1] Encrypt")
-        print("[2] Decrypt")
-        print("[3] Exit")
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip() == "":
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+# ----------------------
+# Main loop
+# ----------------------
+def main_loop():
+    while True:
+        print("\n1 = Encrypt")
+        print("2 = Decrypt")
+        print("3 = Exit")
         choice = input("Choose: ").strip()
-
-        if choice == "3":
-            return
-
         if choice == "1":
-            plaintext = input("Enter plaintext: ")
-            passphrase = input("Enter passphrase: ")
-            pkg = encrypt(plaintext, passphrase)
-            print("\nCiphertext package:\n")
-            print(json.dumps(pkg, indent=2))
-
+            pt = input("Enter plaintext: ")
+            pw = input("Enter passphrase: ")
+            pkg = encrypt(pt, pw)
+            print("\nCIPHERTEXT PACKAGE (also saved to cipher.json):")
+            print(json.dumps(pkg))   # single-line JSON for safe copying
         elif choice == "2":
-            package_json = input("Paste ciphertext package JSON: ")
-            passphrase = input("Enter passphrase: ")
+            pw = input("Enter passphrase: ")
+            print("Decrypt options:")
+            print(" 1) Paste JSON (multi-line allowed)")
+            print(" 2) Load from cipher.json file")
+            sub = input("Choose 1 or 2: ").strip()
+            if sub == "1":
+                js = read_multiline_json_prompt()
+            elif sub == "2":
+                try:
+                    with open("cipher.json", "r") as f:
+                        js = f.read()
+                    print("Loaded cipher.json")
+                except Exception as e:
+                    print("Failed to open cipher.json:", e)
+                    continue
+            else:
+                print("Invalid choice")
+                continue
+
             try:
-                result = decrypt(package_json, passphrase)
-                print("\nDecrypted plaintext:\n")
-                print(result)
+                pkg = json.loads(js)
+            except Exception as e:
+                print("Invalid JSON:", e)
+                continue
+
+            try:
+                recovered = decrypt(pkg, pw)
+                print("Recovered plaintext:", recovered)
             except Exception as e:
                 print("Decryption failed:", e)
-
+        elif choice == "3":
+            print("Exiting.")
+            break
         else:
-            print("Invalid option.")
+            print("Invalid.")
 
 if __name__ == "__main__":
-    main()
+    main_loop()
