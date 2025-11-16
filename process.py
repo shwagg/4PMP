@@ -1,292 +1,294 @@
-#!/usr/bin/env python3
 import os
 import json
 import base64
 import hashlib
-import secrets
 
-# ============================================================
-#   UTILITY FUNCTIONS
-# ============================================================
+# ================================================================
+#   Utility Functions
+# ================================================================
 
-def b64e(b: bytes) -> str:
-    return base64.b64encode(b).decode("utf-8")
+# Base64 encode/decode
+def b64e(b):
+    return base64.b64encode(b).decode()
 
-def b64d(s: str) -> bytes:
+def b64d(s):
     return base64.b64decode(s)
-# ------------------------------------------------------------
-#   KEY DERIVATION (PBKDF2 → 128-bit key)
-# ------------------------------------------------------------
 
-def derive_128bit_key(passphrase: str, salt: bytes):
-    key = hashlib.pbkdf2_hmac(
-        "sha256",
-        passphrase.encode("utf-8"),
-        salt,
-        200_000,
-        dklen=16
-    )
-    return key
+def pbkdf2_key(passphrase, salt, length=16):
+    """
+    Derive a 128-bit key from the passphrase using PBKDF2-HMAC-SHA256.
+    Salt ensures the key is unique each time.
+    """
+    return hashlib.pbkdf2_hmac("sha256", passphrase.encode(), salt, 100000)[:length]
 
-# ------------------------------------------------------------
-#   KEYED SUBSTITUTION
-# ------------------------------------------------------------
-
-def substitute_chars(chars, flags, key, verbose=False):
-    out = []
-    for i, ch in enumerate(chars):
-        kb = key[i % 16]
-
-        if flags[i] == 1 and ch.isalpha():
-            base = ord('A') if ch.isupper() else ord('a')
-            old = ord(ch) - base
-            shift = kb % 26
-            new_val = (old + shift) % 26
-            new_char = chr(base + new_val)
-
-            if verbose:
-                print(f" idx {i:2d} '{ch}'  key={kb} shift={shift:2d} -> '{new_char}'")
-
-            out.append(new_char)
-
-        else:
-            shifted = (ord(ch) + kb) % 65536
-            new_char = chr(shifted)
-
-            if verbose:
-                print(f" idx {i:2d} '{ch}'  key={kb} NONLETTER -> '{new_char}'")
-
-            out.append(new_char)
-
-    return out
-
-# ------------------------------------------------------------
-#   REVERSE SUBSTITUTION
-# ------------------------------------------------------------
-
-def reverse_substitute(chars, flags, key):
-    out = []
-    for i, ch in enumerate(chars):
-        kb = key[i % 16]
-
-        if flags[i] == 1 and ch.isalpha():
-            base = ord('A') if ch.isupper() else ord('a')
-            old = ord(ch) - base
-            shift = kb % 26
-            new_val = (old - shift) % 26
-            new_char = chr(base + new_val)
-            out.append(new_char)
-        else:
-            old_code = (ord(ch) - kb) % 65536
-            out.append(chr(old_code))
-
-    return out
-
-# ------------------------------------------------------------
-#   SHIFT-MERGE TRANSPOSITION
-# ------------------------------------------------------------
-
-def shiftmerge_transpose(lst, key, verbose=False):
-    odds = lst[0::2]
-    evens = lst[1::2]
-
-    if len(evens) > 0:
-        shift_amt = key[1] % len(evens)
-        evens = evens[-shift_amt:] + evens[:-shift_amt]
-    else:
-        shift_amt = 0
-
-    if verbose:
-        print(" odd:", odds)
-        print(" even:", evens)
-        print(" shift amount:", shift_amt)
-
-    merged = []
-    o = 0
-    e = 0
-    for i in range(len(lst)):
-        if i % 2 == 0:
-            merged.append(odds[o])
-            o += 1
-        else:
-            merged.append(evens[e])
-            e += 1
-
-    return merged
-
-# ------------------------------------------------------------
-#   REVERSE TRANSPOSE
-# ------------------------------------------------------------
-
-def shiftmerge_untranspose(lst, key):
-    n = len(lst)
-    odds = lst[0::2]
-    evens = lst[1::2]
-
-    if len(evens) > 0:
-        shift_amt = key[1] % len(evens)
-        evens = evens[shift_amt:] + evens[:shift_amt]
-
-    out = []
-    o = 0
-    e = 0
-    for i in range(n):
-        if i % 2 == 0:
-            out.append(odds[o])
-            o += 1
-        else:
-            out.append(evens[e])
-            e += 1
-
-    return out
-
-# ------------------------------------------------------------
-#   XOR KEYSTREAM FOR METADATA ENCRYPTION
-# ------------------------------------------------------------
-
-def keystream_xor(label: str, key: bytes, nonce: bytes, plaintext: bytes):
-    out = bytearray()
+def keystream(key, nonce, label, length):
+    """
+    Creates a deterministic keystream using SHA-256(key || nonce || label || counter).
+    
+    label: "space" or "flags" (so keystreams differ)
+    nonce: ensures keystream is unique per encryption run.
+    """
+    out = b""
     counter = 0
-    while len(out) < len(plaintext):
+    while len(out) < length:
         block = hashlib.sha256(
             key + nonce + label.encode() + counter.to_bytes(4, "big")
         ).digest()
-        out.extend(block)
+        out += block
         counter += 1
-    return bytes(p ^ k for (p, k) in zip(plaintext, out[: len(plaintext)]))
+    return out[:length]
 
-# ============================================================
-#   ENCRYPTION (VERBOSE)
-# ============================================================
+# ================================================================
+#   EKSMC ENCRYPTION
+# ================================================================
 
-def eksmc_encrypt_verbose(plaintext: str, passphrase: str):
-    print("Plaintext:", plaintext)
-    salt = secrets.token_bytes(16)
-    print("Salt:", b64e(salt))
+def encrypt(plaintext, passphrase):
+    print("\n====== ENCRYPTION START ======\n")
 
-    key = derive_128bit_key(passphrase, salt)
-    print("Derived key (hex):", key.hex())
+    # ------------------------------------------------------------
+    # 1) Key Derivation
+    # ------------------------------------------------------------
+    salt = os.urandom(16)
+    key = pbkdf2_key(passphrase, salt)
 
-    nonce = secrets.token_bytes(12)
-    print("Nonce:", b64e(nonce))
+    print("Salt (hex):", salt.hex())
+    print("128-bit Key (hex):", key.hex(), "\n")
 
-    compact = []
+    # ------------------------------------------------------------
+    # 2) Remove spaces and record their positions
+    # ------------------------------------------------------------
     space_positions = []
-    flags = []
+    compact = []
 
-    for idx, ch in enumerate(plaintext):
+    for i, ch in enumerate(plaintext):
         if ch == " ":
             space_positions.append(len(compact))
         else:
             compact.append(ch)
-            flags.append(1 if ch.isalpha() else 0)
 
-    print("\nCompacted characters:", compact)
+    print("Compact text:", "".join(compact))
     print("Space positions:", space_positions)
-    print("Flags:", flags)
 
-    print("\n--- SUBSTITUTION ---")
-    substituted = substitute_chars(compact, flags, key, verbose=True)
+    flags = [1 if c.isalpha() else 0 for c in compact]
+    print("Flags:", flags, "\n")
 
-    print("\n--- TRANSPOSITION ---")
-    transposed = shiftmerge_transpose(substituted, key, verbose=True)
+    # ------------------------------------------------------------
+    # 3) Keyed Substitution
+    # ------------------------------------------------------------
+    substituted = []
+    shifts = []
 
-    main_cipher_bytes = "".join(transposed).encode("utf-8")
-    main_cipher_b64 = b64e(main_cipher_bytes)
+    for i, ch in enumerate(compact):
+        k = key[i % 16]
 
-    sp_bytes = ",".join(map(str, space_positions)).encode()
-    fl_bytes = bytes(flags)
+        if ch.isalpha():
+            base = ord('A') if ch.isupper() else ord('a')
+            val = ord(ch) - base
+            shift = k % 26
+            shifts.append(shift)
+            new_val = (val + shift) % 26
+            substituted.append(chr(base + new_val))
+        else:
+            shift = k
+            shifts.append(shift)
+            substituted.append(chr((ord(ch) + shift) % 256))
 
-    space_enc = keystream_xor("space", key, nonce, sp_bytes)
-    flags_enc = keystream_xor("flags", key, nonce, fl_bytes)
+    print("Substitution shifts:", shifts)
+    print("After substitution:", "".join(substituted), "\n")
 
-    noiseL = secrets.token_bytes(3)
-    noiseR = secrets.token_bytes(3)
+    # ------------------------------------------------------------
+    # 4) Shift-Merge Transposition
+    # ------------------------------------------------------------
+    odd = substituted[0::2]
+    even = substituted[1::2]
 
+    print("Odd group:", odd)
+    print("Even group:", even)
+
+    if len(even) > 0:
+        s = key[1] % len(even)
+        even = even[-s:] + even[:-s]
+
+    print("Shifted even group:", even)
+
+    merged = []
+    o = e = 0
+    while o < len(odd) or e < len(even):
+        if o < len(odd):
+            merged.append(odd[o])
+            o += 1
+        if e < len(even):
+            merged.append(even[e])
+            e += 1
+
+    print("After transposition:", "".join(merged), "\n")
+
+    main_bytes = "".join(merged).encode()
+
+    # ------------------------------------------------------------
+    # 5) Encrypt space positions & flags using keystream
+    # ------------------------------------------------------------
+    nonce = os.urandom(12)
+
+    space_bytes = ",".join(map(str, space_positions)).encode()
+    ks_space = keystream(key, nonce, "space", len(space_bytes))
+    space_enc = bytes([a ^ b for a, b in zip(space_bytes, ks_space)])
+
+    flag_bytes = bytes(flags)
+    ks_flags = keystream(key, nonce, "flags", len(flag_bytes))
+    flags_enc = bytes([a ^ b for a, b in zip(flag_bytes, ks_flags)])
+
+    print("Space bytes:", space_bytes)
+    print("Space keystream:", ks_space.hex())
+    print("Encrypted space bytes:", space_enc.hex(), "\n")
+
+    print("Flag bytes:", flag_bytes)
+    print("Flag keystream:", ks_flags.hex())
+    print("Encrypted flag bytes:", flags_enc.hex(), "\n")
+
+    # ------------------------------------------------------------
+    # 6) Noise injection
+    # ------------------------------------------------------------
+    noiseL = os.urandom(3)
+    noiseR = os.urandom(3)
+
+    print("NoiseL:", noiseL.hex())
+    print("NoiseR:", noiseR.hex(), "\n")
+
+    # ------------------------------------------------------------
+    # FINAL JSON PACKAGE CIPHERTEXT
+    # ------------------------------------------------------------
     package = {
         "salt": b64e(salt),
         "nonce": b64e(nonce),
-        "main_cipher": main_cipher_b64,
-        "noiseL": b64e(noiseL),
+        "main_cipher": b64e(main_bytes),
         "space_enc": b64e(space_enc),
         "flags_enc": b64e(flags_enc),
-        "noiseR": b64e(noiseR),
+        "noiseL": b64e(noiseL),
+        "noiseR": b64e(noiseR)
     }
 
-    return json.dumps(package), key, salt
+    print("FINAL CIPHERTEXT PACKAGE:\n", json.dumps(package, indent=4))
+    print("\n====== ENCRYPTION END ======\n")
 
-# ============================================================
-#   DECRYPTION (VERBOSE)
-# ============================================================
+    return package
 
-def eksmc_decrypt_verbose(package_json: str, passphrase: str):
-    pkg = json.loads(package_json)
+# ================================================================
+#   EKSMC DECRYPTION
+# ================================================================
 
-    salt = b64d(pkg["salt"])
-    nonce = b64d(pkg["nonce"])
-    key = derive_128bit_key(passphrase, salt)
+def decrypt(package, passphrase):
+    print("\n====== DECRYPTION START ======\n")
 
-    print("Derived key (hex):", key.hex())
+    # ------------------------------------------------------------
+    # 1) Re-derive key using the salt
+    # ------------------------------------------------------------
+    salt = b64d(package["salt"])
+    nonce = b64d(package["nonce"])
+    key = pbkdf2_key(passphrase, salt)
 
-    space_enc = b64d(pkg["space_enc"])
-    flags_enc = b64d(pkg["flags_enc"])
-    main_bytes = b64d(pkg["main_cipher"])
+    print("Salt (hex):", salt.hex())
+    print("128-bit Key (hex):", key.hex(), "\n")
 
-    sp_bytes = keystream_xor("space", key, nonce, space_enc)
-    fl_bytes = keystream_xor("flags", key, nonce, flags_enc)
+    main_bytes = b64d(package["main_cipher"])
+    space_enc = b64d(package["space_enc"])
+    flags_enc = b64d(package["flags_enc"])
 
-    space_positions = list(map(int, sp_bytes.decode().split(","))) if sp_bytes else []
-    flags = list(fl_bytes)
+    # ------------------------------------------------------------
+    # 2) Decrypt space bytes and flags
+    # ------------------------------------------------------------
+    ks_space = keystream(key, nonce, "space", len(space_enc))
+    space_bytes = bytes([a ^ b for a, b in zip(space_enc, ks_space)])
+    print("Decrypted space bytes:", space_bytes)
 
-    print("Recovered space positions:", space_positions)
-    print("Recovered flags:", flags)
+    ks_flags = keystream(key, nonce, "flags", len(flags_enc))
+    flags = list(bytes([a ^ b for a, b in zip(flags_enc, ks_flags)]))
+    print("Decrypted flags:", flags, "\n")
 
-    transposed = list(main_bytes.decode("utf-8"))
-    untransposed = shiftmerge_untranspose(transposed, key)
+    space_positions = (
+        [int(x) for x in space_bytes.decode().split(",")]
+        if space_bytes else []
+    )
 
-    reversed_sub = reverse_substitute(untransposed, flags, key)
+    # ------------------------------------------------------------
+    # 3) Reverse Shift-Merge transposition
+    # ------------------------------------------------------------
+    merged = list(main_bytes.decode())
+    L = len(merged)
 
-    result = reversed_sub[:]
-    for pos in space_positions:
-        result.insert(pos, " ")
+    odd_len = (L + 1) // 2
+    even_len = L // 2
 
-    return "".join(result)
+    odd_part = merged[:odd_len]
+    even_part = merged[odd_len:]
 
-# ============================================================
-#   INTERACTIVE MENU (VERSION B)
-# ============================================================
+    if len(even_part) > 0:
+        s = key[1] % len(even_part)
+        even_part = even_part[s:] + even_part[:s]
 
-def main():
-    while True:
-        print("\n=== Enhanced Keyed Shift-Merge Cipher (EKSMC) ===")
-        print("[1] Encrypt plaintext")
-        print("[2] Decrypt ciphertext package")
-        print("[3] Exit")
-
-        choice = input("Choose: ").strip()
-        if choice == "3":
-            print("Goodbye!")
-            break
-
-        passphrase = input("Enter passphrase: ").strip()
-
-        if choice == "1":
-            plaintext = input("Enter plaintext: ").strip()
-            print("\n--- ENCRYPTING ---\n")
-            package_json, key, salt = eksmc_encrypt_verbose(plaintext, passphrase)
-            print("\n=== FINAL CIPHERTEXT PACKAGE ===\n")
-            print(package_json)
-
-        elif choice == "2":
-            print("\nPaste ciphertext package JSON:")
-            package_json = input().strip()
-            print("\n--- DECRYPTING ---\n")
-            result = eksmc_decrypt_verbose(package_json, passphrase)
-            print("\n=== FINAL PLAINTEXT ===\n")
-            print(result)
-
+    restored = []
+    oi = ei = 0
+    for i in range(L):
+        if i % 2 == 0:
+            restored.append(odd_part[oi])
+            oi += 1
         else:
-            print("Invalid option.")
+            restored.append(even_part[ei])
+            ei += 1
 
-if __name__ == "__main__":
-    main()
+    print("After un-transpose:", "".join(restored))
+
+    # ------------------------------------------------------------
+    # 4) Reverse substitution
+    # ------------------------------------------------------------
+    result = []
+    for i, ch in enumerate(restored):
+        k = key[i % 16]
+
+        if flags[i] == 1:
+            base = ord('A') if ch.isupper() else ord('a')
+            val = ord(ch) - base
+            orig = (val - (k % 26)) % 26
+            result.append(chr(base + orig))
+        else:
+            result.append(chr((ord(ch) - k) % 256))
+
+    print("After reverse substitution:", "".join(result))
+
+    # ------------------------------------------------------------
+    # 5) Reinsert spaces
+    # ------------------------------------------------------------
+    result_chars = result.copy()
+    for pos in sorted(space_positions):
+        result_chars.insert(pos, " ")
+
+    plaintext = "".join(result_chars)
+
+    print("Recovered plaintext:", plaintext)
+    print("\n====== DECRYPTION END ======\n")
+
+    return plaintext
+
+# ================================================================
+#   MAIN PROGRAM
+# ================================================================
+
+print("EKSMC Encryption/Decryption Demo")
+print("1 = Encrypt")
+print("2 = Decrypt")
+choice = input("Choose: ")
+
+if choice == "1":
+    pt = input("Enter plaintext: ")
+    pw = input("Enter passphrase: ")
+    encrypt(pt, pw)
+
+elif choice == "2":
+    pw = input("Enter passphrase: ")
+    print("Paste the ciphertext package (JSON):")
+    js = input()
+    package = json.loads(js)
+    decrypt(package, pw)
+
+else:
+    print("Invalid choice.")
