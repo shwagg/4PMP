@@ -169,6 +169,9 @@ def encrypt(plaintext: str, passphrase: str, noise_bytes: int = 8) -> dict:
 
     print("Step 8: Package created (saved to cipher.json)")
     print(json.dumps(package, indent=4))
+
+    final_b64 = base64.b64encode(json.dumps(package, indent=4).encode()).decode()
+    print("\nThis is final_b64:\n" + final_b64)
     print("\n=== ENCRYPTION: End ===\n")
     return package
 
