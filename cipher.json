@@ -1,9 +1,10 @@
 {
-    "salt": "FC1yEJ5piB3QQTLcfWou4g==",
-    "nonce": "6OFOmjpnavLY7T4a",
-    "main_cipher": "c3d5cXZyZ3pza0tpbnhnYVp2b3I=",
-    "space_enc": "",
-    "flags_enc": "2XnNIoBw9GrCO8mX+03k7XtcBIM=",
-    "case_enc": "AHuScK56IQrlSGiziAndRm2mVp0=",
-    "compact_len": 20
+    "salt": "PBl2gDZH0SGnIIVQr7NQLg==",
+    "nonce": "K6JaAz5m6D7XfieI",
+    "main": "VFp0T214VmJXdqFBJw==",
+    "space": "0aUbSA==",
+    "flags": "Kz4uY3h9Z9oXDdm+iA==",
+    "case": "ead5SfQMh/pUEiH5SA==",
+    "noiseL": "CdAODNq6cdA=",
+    "noiseR": "NKmGlfqhzEs="
 }

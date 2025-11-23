@@ -37,9 +37,9 @@ def left_rotate(lst, s):
     return lst[s:] + lst[:s]
 
 # ----------------------
-# EKSMC: Encryption (matches Process Flow)
+# EKSMC: Encryption (fixed, lossless)
 # ----------------------
-def encrypt(plaintext: str, passphrase: str) -> dict:
+def encrypt(plaintext: str, passphrase: str, noise_bytes: int = 8) -> dict:
     print("\n=== ENCRYPTION: Start ===\n")
 
     # Step 1: Key derivation
@@ -76,7 +76,7 @@ def encrypt(plaintext: str, passphrase: str) -> dict:
     print("  flags (1=alpha):", flags)
     print("  case_flags (1=UP,0=low,2=non-letter):", case_flags, "\n")
 
-    # Step 4: Keyed substitution (K[i mod 16], letters shifted)
+    # Step 4: Keyed substitution (K[i mod len(key)], letters shifted)
     substituted = []
     substituted_display = []
     for i, ch in enumerate(compact_chars):
@@ -139,71 +139,108 @@ def encrypt(plaintext: str, passphrase: str) -> dict:
     case_enc = bytes([a ^ b for a,b in zip(case_bytes, ks_case)]) if case_bytes else b""
     print("  case_bytes:", list(case_bytes), " -> case_enc(base64):", b64e(case_enc), "\n")
 
-    # Step 7: Noise injection (optional) & packaging
-    # (kept out for simplicity; you can add noise fields if needed)
+    # Step 7: Noise injection — final JSON fields per methodology (but we include case for correctness)
+    noiseL_raw = os.urandom(noise_bytes)
+    noiseR_raw = os.urandom(noise_bytes)
+    ks_noiseL = keystream(key, nonce, "noiseL", len(noiseL_raw))
+    ks_noiseR = keystream(key, nonce, "noiseR", len(noiseR_raw))
+    noiseL_enc = bytes([a ^ b for a,b in zip(noiseL_raw, ks_noiseL)])
+    noiseR_enc = bytes([a ^ b for a,b in zip(noiseR_raw, ks_noiseR)])
+
+    print("Step 7: Noise generated and encrypted (raw hex for audit):")
+    print("  noiseL_raw (hex):", noiseL_raw.hex())
+    print("  noiseR_raw (hex):", noiseR_raw.hex())
+    print("  noiseL_enc (base64):", b64e(noiseL_enc))
+    print("  noiseR_enc (base64):", b64e(noiseR_enc), "\n")
+
+    # Final JSON packaging
     package = {
         "salt": b64e(salt),
         "nonce": b64e(nonce),
-        "main_cipher": b64e(main_bytes),
-        "space_enc": b64e(space_enc),
-        "flags_enc": b64e(flags_enc),
-        "case_enc": b64e(case_enc),
-        "compact_len": compact_len
+        "main": b64e(main_bytes),
+        "space": b64e(space_enc),
+        "flags": b64e(flags_enc),
+        "case": b64e(case_enc),
+        "noiseL": b64e(noiseL_enc),
+        "noiseR": b64e(noiseR_enc)
     }
     with open("cipher.json", "w") as f:
         json.dump(package, f, indent=4)
 
-    print("Step 7: Package created (also saved to cipher.json)")
-    print(json.dumps(package))
+    print("Step 8: Package created (saved to cipher.json)")
+    print(json.dumps(package, indent=4))
     print("\n=== ENCRYPTION: End ===\n")
     return package
 
 # ----------------------
-# EKSMC: Decryption (matches Process Flow)
+# EKSMC: Decryption (matches Process Flow and is lossless)
 # ----------------------
 def decrypt(package: dict, passphrase: str) -> str:
     print("\n=== DECRYPTION: Start ===\n")
 
-    required = ["salt","nonce","main_cipher","space_enc","flags_enc","case_enc","compact_len"]
+    required = ["salt","nonce","main","space","flags","noiseL","noiseR"]  
     for r in required:
         if r not in package:
             raise ValueError(f"Missing field: {r}")
 
     salt = b64d(package["salt"])
     nonce = b64d(package["nonce"])
-    main_bytes = b64d(package["main_cipher"])
-    space_enc = b64d(package["space_enc"])
-    flags_enc = b64d(package["flags_enc"])
-    case_enc = b64d(package["case_enc"])
-    compact_len = int(package["compact_len"])
+    main_bytes = b64d(package["main"])
+    space_enc = b64d(package["space"])
+    flags_enc = b64d(package["flags"])
+    noiseL_enc = b64d(package["noiseL"])
+    noiseR_enc = b64d(package["noiseR"])
+    case_enc = b64d(package.get("case",""))
 
     key = pbkdf2_key(passphrase, salt)
     print("Step 1: Re-derive key")
     print("  salt (hex):", salt.hex())
     print("  key (hex):", key.hex(), "\n")
 
-    # sanity checks
-    if len(main_bytes) != compact_len:
-        raise ValueError("main_cipher length mismatch")
-    if len(flags_enc) != compact_len:
-        raise ValueError("flags_enc length mismatch")
-    if len(case_enc) != compact_len:
-        raise ValueError("case_enc length mismatch")
+    # Recover noise for audit
+    if noiseL_enc:
+        ks_noiseL = keystream(key, nonce, "noiseL", len(noiseL_enc))
+        noiseL_raw = bytes([a ^ b for a,b in zip(noiseL_enc, ks_noiseL)])
+        print("Recovered noiseL_raw (hex):", noiseL_raw.hex())
+    else:
+        print("No noiseL present")
 
-    print("Step 2: main_cipher and lengths OK")
+    if noiseR_enc:
+        ks_noiseR = keystream(key, nonce, "noiseR", len(noiseR_enc))
+        noiseR_raw = bytes([a ^ b for a,b in zip(noiseR_enc, ks_noiseR)])
+        print("Recovered noiseR_raw (hex):", noiseR_raw.hex())
+    else:
+        print("No noiseR present")
+    print()
+
+    # Derive compact_len from flags_enc length
+    compact_len = len(flags_enc)
+    print("Derived compact_len from flags_enc length:", compact_len, "\n")
+
+    # sanity check main length
+    if len(main_bytes) != compact_len:
+        raise ValueError("main length mismatch: expected compact_len bytes")
+
+    print("Step 2: main and metadata lengths OK")
     print("  main_bytes (list):", list(main_bytes))
     print("  compact_len:", compact_len, "\n")
 
     # Step 3: Recover flags & case_flags using keystreams
     ks_flags = keystream(key, nonce, "flags", compact_len)
-    flag_bytes = bytes([a ^ b for a,b in zip(flags_enc, ks_flags)])
-    flags = list(flag_bytes)
+    flag_bytes = bytes([a ^ b for a,b in zip(flags_enc, ks_flags)]) if flags_enc else b""
+    flags = list(flag_bytes) if flag_bytes else []
     print("Step 3: Recovered flags:", flags)
 
-    ks_case = keystream(key, nonce, "case", compact_len)
-    case_bytes = bytes([a ^ b for a,b in zip(case_enc, ks_case)])
-    case_flags = list(case_bytes)
-    print("Step 3: Recovered case_flags:", case_flags, "\n")
+    if case_enc:
+        ks_case = keystream(key, nonce, "case", compact_len)
+        case_bytes = bytes([a ^ b for a,b in zip(case_enc, ks_case)]) if case_enc else b""
+        case_flags = list(case_bytes) if case_bytes else []
+        print("Step 3: Recovered case_flags (from case field):", case_flags)
+    else:
+        # Fallback only if 'case' absent — this is lossy: assume lowercase for letters
+        case_flags = [0 if f==1 else 2 for f in flags]
+        print("Step 3: 'case' field missing; using fallback case_flags (lowercase for letters):", case_flags)
+    print()
 
     # Step 4: Recover space positions
     if space_enc:
@@ -218,19 +255,16 @@ def decrypt(package: dict, passphrase: str) -> str:
     merged = list(main_bytes)  # list of ints
     print("Step 5: merged bytes (interleaved):", merged)
 
-    # IMPORTANT: deinterleave using slicing with step 2 (this matches the interleave)
     odd_rot = merged[0::2]
     even_rot = merged[1::2]
     print("  odd_rot (from merged[0::2]):", odd_rot)
     print("  even_rot (from merged[1::2]):", even_rot)
 
-    # undo rotation applied during encryption: left-rotate even_rot by s
     s = key[1] % (len(even_rot) if len(even_rot)>0 else 1)
     even = left_rotate(even_rot, s) if even_rot else []
     print("  rotation s (key[1] % len(even)) =", s)
     print("  even (after left-rotate):", even)
 
-    # re-interleave odd and even to reconstruct substituted bytes
     restored = []
     oi = ei = 0
     while oi < len(odd_rot) or ei < len(even):
@@ -240,23 +274,21 @@ def decrypt(package: dict, passphrase: str) -> str:
             restored.append(even[ei]); ei += 1
     print("  restored substituted bytes:", restored, "\n")
 
-    # Step 6: Reverse substitution using flags & case_flags (deterministic)
+    # Step 6: Reverse substitution using flags & case_flags
     print("Step 6: Reverse substitution")
     result_chars = []
     for i, code in enumerate(restored):
         k = key[i % len(key)]
-        if flags[i] == 1:
-            if case_flags[i] == 1:
+        if i < len(flags) and flags[i] == 1:
+            if i < len(case_flags) and case_flags[i] == 1:
                 base = ord('A')
-            elif case_flags[i] == 0:
-                base = ord('a')
             else:
                 base = ord('a')
             val = code - base
             orig = (val - (k % 26)) % 26
             ch = chr(base + orig)
             result_chars.append(ch)
-            print(f"  idx {i}: code=0x{code:02x} flag=1 case={case_flags[i]} -> {ch}")
+            print(f"  idx {i}: code=0x{code:02x} flag=1 case={case_flags[i] if i < len(case_flags) else 'NA'} -> {ch}")
         else:
             orig = (code - k) % 256
             ch = chr(orig)
@@ -302,7 +334,12 @@ def main_loop():
         if choice == "1":
             pt = input("Enter plaintext: ")
             pw = input("Enter passphrase: ")
-            pkg = encrypt(pt, pw)
+            nb = input("Noise bytes to inject (default 8): ").strip()
+            try:
+                nb_int = int(nb) if nb else 8
+            except:
+                nb_int = 8
+            pkg = encrypt(pt, pw, noise_bytes=nb_int)
             print("\nSingle-line JSON (safe to copy):")
             print(json.dumps(pkg))
         elif choice == "2":
